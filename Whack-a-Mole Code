@@ -1,0 +1,398 @@
+#include <IRremote.h>
+#include <U8g2lib.h>  
+
+U8G2_SH1106_128X64_NONAME_1_HW_I2C lander_display(U8G2_R0, /* reset=*/U8X8_PIN_NONE); //Display setup
+
+const int RECV_PIN = 4; //Receiver pin
+const int LEARN_PIN = 3;  // Button used to trigger remote setup mode
+const int GAME_PIN  = 2;  // Button used to trigger Wack a Mole game
+
+// LED pairs (green/red for each "mole")
+// Index 0: 12/11, Index 1: 10/9, Index 2: 8/7, Index 3: 6/5 (its easiest with indexes tbh)
+const int RED_PINS[]   = {12, 10, 8, 6};
+const int GREEN_PINS[] = {11, 9, 7, 5};  
+const int NUM_MOLES = 4;
+
+// stores 4 learned buttons
+uint32_t buttons[NUM_MOLES];
+
+//Score Variable
+int score;
+
+//Countdown Variable
+int countdownValue = 0;
+
+// game variables
+bool gameActive = false;
+enum State {STATE_IDLE, STATE_REMOTESETUP, STATE_GAME};
+State currentState = STATE_IDLE;
+
+//game time variables
+unsigned long gameOverTime = 0;
+const unsigned long gameOverDuration = 5000;
+
+// true = red (mole up), false = green (mole down)
+bool ledState[NUM_MOLES];             
+unsigned long nextRedTime = 0;
+unsigned long redInterval = 2000; // start interval 2s
+unsigned long buttonDebounceTime = 0; // debounce the physical buttons so no repeating signals
+
+//Display Variables
+byte font_height; 
+
+//Draw String Method
+byte drawCenteredString(byte y, char *string);
+
+void setup() {
+  score = 0;
+  Serial.begin(9600);
+
+  //Display Setup
+  lander_display.begin();  // Initialize our display
+  font_height = lander_display.getMaxCharHeight(); // Save the number of vertical pixels required for the tallest character in the current font
+  lander_display.setFont(u8g2_font_ncenB08_tr);  // choose a suitable font
+  
+
+  // Set up LED pins
+  for (int i = 0; i < NUM_MOLES; i++){
+    pinMode(GREEN_PINS[i], OUTPUT);
+    pinMode(RED_PINS[i], OUTPUT);
+  }
+
+  // Input buttons
+  pinMode(LEARN_PIN, INPUT_PULLUP);
+  pinMode(GAME_PIN, INPUT_PULLUP); 
+
+  // Initial LED states (all green/mole down)
+  for (int i = 0; i < NUM_MOLES; i++) {
+    digitalWrite(GREEN_PINS[i], HIGH);
+    digitalWrite(RED_PINS[i], LOW);
+    ledState[i] = false; 
+  }
+
+  // Start the IR Receiver
+  IrReceiver.begin(RECV_PIN, ENABLE_LED_FEEDBACK);
+  Serial.println("IR Receiver started");
+}
+
+// LED blink helper to reduce lag by using an if statement rather than delay
+void blinkLED(int ledPin, unsigned long &lastMillis, bool &ledStateLocal, unsigned long interval = 300) {
+  if (millis() - lastMillis >= interval) {
+    ledStateLocal = !ledStateLocal;
+    digitalWrite(ledPin, ledStateLocal ? HIGH : LOW);
+    lastMillis = millis();
+  }
+}
+
+// Remote setup mode
+void remoteSetUp() {
+  Serial.println("Beginning remote setup... Press buttons now");
+  gameActive = false;
+  
+  //Display state
+  currentState = STATE_REMOTESETUP;
+
+  //Display Remote SetUp
+  lander_display.firstPage();
+    do {
+      lander_display.setFontPosTop();
+
+      // Draw the setup messages while learning buttons
+      drawCenteredString(18, "Beginning Remote");
+      drawCenteredString(30, "Setup");
+  
+    } while (lander_display.nextPage());
+  
+  // Set all LEDs off (ready for setup)
+  for (int i = 0; i < NUM_MOLES; i++) {
+      digitalWrite(GREEN_PINS[i], LOW); 
+      digitalWrite(RED_PINS[i], LOW); 
+  }
+
+  unsigned long lastBlink = 0;
+  bool ledStateLocal = false;
+  
+  for (int i = 0; i < NUM_MOLES;) {
+    int ledPin = GREEN_PINS[i]; 
+    blinkLED(ledPin, lastBlink, ledStateLocal);
+
+    if (IrReceiver.decode()) {
+      if (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) {
+        IrReceiver.resume();
+        continue;
+      }
+
+    uint32_t code = IrReceiver.decodedIRData.command;
+    buttons[i] = code;
+
+    Serial.print("Stored button[");
+    Serial.print(i);
+    Serial.print("] = 0x");
+    Serial.println(code, HEX);
+
+    //Display Button 
+      char status_msg[20];
+      snprintf(status_msg, sizeof(status_msg), "Press Button %d", i + 1);
+      drawCenteredString(42, status_msg);
+      
+
+      digitalWrite(ledPin, HIGH); // Keep green LEDs on after remote setup
+      i++;
+      lastBlink = millis(); 
+      IrReceiver.resume();
+    }
+  }
+  
+  Serial.println("Remote setup complete!");
+  drawCenteredString(30, "Remote Setup Complete!");
+ 
+  // flash green/red to indicate setup complete
+  for (int i = 0; i < NUM_MOLES; i++) digitalWrite(RED_PINS[i], HIGH);
+  delay(500);
+  for (int i = 0; i < NUM_MOLES; i++) digitalWrite(RED_PINS[i], LOW);
+  delay(500);
+  // Restore to all green state
+  for (int i = 0; i < NUM_MOLES; i++) digitalWrite(GREEN_PINS[i], HIGH);
+  
+  currentState = STATE_IDLE; //State set back to IDLE when setup complete
+}
+
+// Start Wack-a-Mole game
+void startGame() {
+  Serial.println("Wack a Mole game starting!");
+  redInterval = 2000;
+  
+  score = 0; //Reset Score
+
+  // Set all LED pairs green for the initial state
+  for (int i = 0; i < NUM_MOLES; i++) {
+    ledState[i] = false; // false means green 
+    digitalWrite(GREEN_PINS[i], HIGH);
+    digitalWrite(RED_PINS[i], LOW);
+  }
+
+  for (int count = 3; count >= 1; count--) {
+    countdownValue = count;// set Countdown value
+
+    for (int j = 0; j < 5; j++) {
+      lander_display.firstPage();
+      do {
+        lander_display.setFontPosTop();
+
+        //Draw String
+        drawCenteredString(18, "Whack a Mole");
+        drawCenteredString(30, "Starting!");
+      } while(lander_display.nextPage());
+      //delay(100);
+    }
+    //delay(500);
+  }
+
+  countdownValue = 0;
+  gameActive = true;
+  currentState = STATE_GAME;
+
+  // Flash LEDs to show game start 
+  for (int j = 0; j < 3; j++) {
+    // Turns all LEDs off to get rid of any red stragglers
+    for (int i = 0; i < NUM_MOLES; i++) {
+        digitalWrite(GREEN_PINS[i], LOW);
+        digitalWrite(RED_PINS[i], LOW); 
+    }
+    delay(200);
+    
+    // 2. Turns all LED pairs back to green
+    for (int i = 0; i < NUM_MOLES; i++) {
+        digitalWrite(GREEN_PINS[i], HIGH);
+        digitalWrite(RED_PINS[i], LOW);
+    }
+    delay(200);
+  }
+  
+  // Calculate nextRedTime after the delays finish
+  nextRedTime = millis() + redInterval; 
+}
+
+// Update Wack a Mole game state
+void updateGame() {
+  // THe time ime to turn a random LED red 
+  if (millis() > nextRedTime) {
+    int idx;
+    int greenCount = 0;
+    
+    // Count how many pairs are green
+    for (int i = 0; i < NUM_MOLES; i++) {
+      if (!ledState[i]) greenCount++; // if ledState[i] == false means green for i
+    }
+    
+    // Only try to turn red if there is at least one green LED
+    if (greenCount > 0) {
+      do {
+        idx = random(0, NUM_MOLES);
+      } while (ledState[idx]); // pick one pair that is green
+
+      // Turn the led pair red 
+      ledState[idx] = true; // Now true means red
+      digitalWrite(GREEN_PINS[idx], LOW); 
+      digitalWrite(RED_PINS[idx], HIGH); 
+
+      // Increase speed by 50 milliseconds (minimum interval 500ms)
+      redInterval = max(500UL, redInterval - 50); 
+      nextRedTime = millis() + redInterval;
+    }
+  }
+
+  // Lose condition met if all red 
+  bool allRed = true;
+  for (int i = 0; i < NUM_MOLES; i++) {
+    if (!ledState[i]) { // If any pair is green then allRed is not true
+      allRed = false;
+      break;
+    }
+  }
+  
+  if (allRed) {
+    Serial.println("Game Over!");
+    gameActive = false;
+    gameOverTime = millis();
+    // flash all red
+    for (int j = 0; j < 3; j++) {
+      for (int i = 0; i < NUM_MOLES; i++) {
+          digitalWrite(GREEN_PINS[i], LOW);
+          digitalWrite(RED_PINS[i], HIGH);
+      }
+      delay(200);
+      for (int i = 0; i < NUM_MOLES; i++) {
+          digitalWrite(GREEN_PINS[i], HIGH);
+          digitalWrite(RED_PINS[i], LOW);
+      }
+      delay(200);
+    }
+
+    // reset all LEDs to original state (all green)
+    for (int i = 0; i < NUM_MOLES; i++) {
+        digitalWrite(GREEN_PINS[i], HIGH);
+        digitalWrite(RED_PINS[i], LOW);
+    }
+  }
+}
+
+// Function for the toggle
+void toggleLed(int index) {
+    int greenPin = GREEN_PINS[index];
+    int redPin = RED_PINS[index];
+    
+    // Check the current state of the green LED to toggle
+    if (digitalRead(greenPin) == HIGH) {
+      digitalWrite(greenPin, LOW);
+      digitalWrite(redPin, HIGH);
+    } else {
+      digitalWrite(greenPin, HIGH);
+      digitalWrite(redPin, LOW);
+    }
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  //Display Update Loop
+  lander_display.firstPage();
+  do{
+    lander_display.setFontPosTop();
+
+    if (currentState == STATE_REMOTESETUP) {
+      //Done in remoteSetUp()
+    }
+    else if (currentState == STATE_GAME) {// display for countdown and Score
+      if (countdownValue > 0){
+        char count_str[2];
+        snprintf(count_str, sizeof(count_str), "%d", countdownValue);
+        drawCenteredString(30, count_str);
+      }
+      else if (gameActive){
+        char score_str[16];
+        snprintf(score_str, sizeof(score_str), "Score: %d", score);
+        drawCenteredString(18, "WHACK THE MOLE!");
+        drawCenteredString(30, score_str);
+      }
+      else {
+        drawCenteredString(18, (char*)"GAME OVER!");
+        char score_str[16];
+        snprintf(score_str, sizeof(score_str), "Final Score: %d", score);
+        drawCenteredString(30, score_str);
+      }
+    }
+    else { // STATE_IDLE
+      // Draw welcome or waiting message
+      drawCenteredString(18, "Wack a Mole");
+      drawCenteredString(30, "Press LEFT for Setup!");
+      drawCenteredString(42, "Press RIGHT to Start!");
+    }
+  } while (lander_display.nextPage());
+
+  if (!gameActive && currentState == STATE_GAME && (currentMillis - gameOverTime >= gameOverDuration)){
+    currentState = STATE_IDLE;
+  }
+  
+  // Use INPUT_PULLUP, so the button is active (LOW) (when pressed)
+  if (currentMillis - buttonDebounceTime > 50) { // 50ms debounce to prevent annoying repeats
+    
+    // Remote setup mode
+    if (digitalRead(LEARN_PIN) == LOW) { // button is pressed
+      remoteSetUp();
+      buttonDebounceTime = currentMillis; 
+      return; 
+    }
+
+    // Start game mode
+    if (!gameActive && digitalRead(GAME_PIN) == LOW) { // Button pressed and game not active
+      startGame();
+      buttonDebounceTime = currentMillis; 
+    }
+  }
+  
+  if (gameActive) updateGame(); // Tells the game to update if it is running
+  
+  if (IrReceiver.decode()) {
+    if (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) {
+      IrReceiver.resume();
+      return;
+    }
+
+    uint32_t code = IrReceiver.decodedIRData.command;
+
+    if (gameActive) {
+      // Pressing corresponding button turns LED green (the moles get wacked)
+      for (int i = 0; i < NUM_MOLES; i++) {
+        // If the code matches and the mole is currently red/true
+        if (code == buttons[i] && ledState[i] == true) { 
+          ledState[i] = false; // Set to false, which is green 
+          digitalWrite(GREEN_PINS[i], HIGH);  
+          digitalWrite(RED_PINS[i], LOW);    
+          
+          //Scoring Logic
+          score++;
+          Serial.print("Score: ");
+          Serial.println(score);
+          
+        }
+      }
+    } else {
+      if (code == buttons[0]) toggleLed(0);
+      if (code == buttons[1]) toggleLed(1);
+      if (code == buttons[2]) toggleLed(2);
+      if (code == buttons[3]) toggleLed(3);
+    }
+
+    IrReceiver.resume();
+  }
+  
+  lander_display.sendBuffer();  // load display
+}
+ 
+// Use the .drawStr() method to draw the current string centered in the current line.
+byte drawCenteredString(byte y, char *string) {
+  byte centered_x = (lander_display.getDisplayWidth() - lander_display.getStrWidth(string)) / 2;
+  lander_display.drawStr(centered_x, y, string);
+}
+
